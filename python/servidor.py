@@ -3,9 +3,11 @@ import msgpack
 import json
 import os
 import re
+from socket import gethostname, gethostbyname
 from time import time
 
 NOME = os.environ.get("NOME", "servidor")
+ENDERECO = gethostbyname(gethostname())  # ip desse container na rede do docker
 PASTA = "dados"
 ARQ_LOGINS = PASTA + "/logins.txt"
 ARQ_CANAIS = PASTA + "/canais.json"
@@ -19,6 +21,14 @@ socket.connect("tcp://broker:5556")
 pub = context.socket(zmq.PUB)
 pub.connect("tcp://proxy:5557")
 
+# socket para falar com o servico de referencia
+ref = context.socket(zmq.REQ)
+ref.connect("tcp://referencia:5559")
+
+relogio = 0        # relogio logico
+ajuste = 0         # correcao do relogio fisico
+qtd_mensagens = 0  # mensagens de clientes recebidas
+
 os.makedirs(PASTA, exist_ok=True)
 
 # carrega os canais que ja estavam salvos
@@ -26,6 +36,11 @@ canais = []
 if os.path.exists(ARQ_CANAIS):
     with open(ARQ_CANAIS) as f:
         canais = json.load(f)
+
+
+def agora():
+    # hora do container corrigida pela referencia
+    return time() + ajuste
 
 
 def salvar_login(usuario, timestamp):
@@ -48,6 +63,28 @@ def nome_valido(nome):
     if not isinstance(nome, str):
         return False
     return re.match("^[a-z0-9_-]{1,20}$", nome) is not None
+
+
+def pedir_referencia(msg):
+    global relogio
+    relogio += 1
+    msg["relogio"] = relogio
+    msg["timestamp"] = agora()
+    print(f"[{NOME}] ENVIADO para referencia:  {msg}", flush=True)
+    ref.send(msgpack.packb(msg))
+    resposta = msgpack.unpackb(ref.recv())
+    relogio = max(relogio, resposta["relogio"])
+    print(f"[{NOME}] RECEBIDO da referencia: {resposta}", flush=True)
+    return resposta
+
+
+def heartbeat():
+    global ajuste
+    resposta = pedir_referencia({"tipo": "heartbeat", "nome": NOME, "endereco": ENDERECO})
+    # aproveita a resposta para acertar o relogio
+    ajuste = resposta["hora"] - time()
+    print(f"[{NOME}] relogio ajustado em {ajuste:.6f}s", flush=True)
+    pedir_referencia({"tipo": "lista"})
 
 
 def login(msg):
@@ -74,6 +111,7 @@ def listar_canais(msg):
 
 
 def publicar(msg):
+    global relogio
     canal = msg.get("canal")
     texto = msg.get("mensagem")
     if not nome_valido(canal):
@@ -83,13 +121,15 @@ def publicar(msg):
     # nao da pra conferir se o canal existe porque ele pode ter sido
     # criado em outro servidor (o broker distribui as requisicoes)
 
+    relogio += 1
     publicacao = {
         "tipo": "publicacao",
         "canal": canal,
         "usuario": msg.get("usuario"),
         "mensagem": texto,
         "servidor": NOME,
-        "timestamp": time(),
+        "timestamp": agora(),
+        "relogio": relogio,
     }
     # o topico e o nome do canal
     pub.send_multipart([canal.encode(), msgpack.packb(publicacao)])
@@ -98,10 +138,12 @@ def publicar(msg):
     return {"tipo": "publicar", "status": "ok"}
 
 
-print(f"[{NOME}] iniciado, {len(canais)} canais carregados", flush=True)
+rank = pedir_referencia({"tipo": "rank", "nome": NOME, "endereco": ENDERECO})["rank"]
+print(f"[{NOME}] iniciado com rank {rank}, {len(canais)} canais carregados", flush=True)
 
 while True:
     msg = msgpack.unpackb(socket.recv())
+    relogio = max(relogio, msg["relogio"])
     print(f"[{NOME}] RECEBIDO: {msg}", flush=True)
 
     tipo = msg.get("tipo")
@@ -116,7 +158,14 @@ while True:
     else:
         resposta = {"tipo": tipo, "status": "erro", "erro": "tipo de mensagem desconhecido"}
 
+    relogio += 1
     resposta["servidor"] = NOME
-    resposta["timestamp"] = time()
+    resposta["timestamp"] = agora()
+    resposta["relogio"] = relogio
     socket.send(msgpack.packb(resposta))
     print(f"[{NOME}] ENVIADO:  {resposta}", flush=True)
+
+    # a cada 10 mensagens de clientes avisa a referencia que esta vivo
+    qtd_mensagens += 1
+    if qtd_mensagens % 10 == 0:
+        heartbeat()

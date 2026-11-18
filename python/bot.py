@@ -9,31 +9,57 @@ NOMES_CANAIS = ["geral", "jogos", "musica", "filmes", "estudos", "futebol", "mem
 FRASES = ["oi pessoal", "alguem ai?", "bom dia", "kkkkk", "concordo", "nao sei", "que legal", "to com sono", "bora", "vou almocar"]
 
 context = zmq.Context()
-socket = context.socket(zmq.REQ)
-socket.connect("tcp://broker:5555")
+
+
+def conectar():
+    s = context.socket(zmq.REQ)
+    s.setsockopt(zmq.RCVTIMEO, 5000)
+    s.setsockopt(zmq.LINGER, 0)
+    s.connect("tcp://broker:5555")
+    return s
+
+
+socket = conectar()
 
 # socket que recebe as publicacoes dos canais
 sub = context.socket(zmq.SUB)
 sub.connect("tcp://proxy:5558")
 inscritos = []
 
+relogio = 0  # relogio logico
+
 
 def enviar(msg):
-    msg["timestamp"] = time()
-    print(f"[{NOME}] ENVIADO:  {msg}", flush=True)
-    socket.send(msgpack.packb(msg))
-    resposta = msgpack.unpackb(socket.recv())
+    global relogio, socket
+    while True:
+        relogio += 1
+        msg["relogio"] = relogio
+        msg["timestamp"] = time()
+        print(f"[{NOME}] ENVIADO:  {msg}", flush=True)
+        socket.send(msgpack.packb(msg))
+        try:
+            resposta = msgpack.unpackb(socket.recv())
+            break
+        except zmq.Again:
+            # ninguem respondeu em 5s (o servidor pode ter caido no meio)
+            # o REQ fica travado esperando, entao abre outro e manda de novo
+            print(f"[{NOME}] sem resposta, tentando de novo", flush=True)
+            socket.close()
+            socket = conectar()
+    relogio = max(relogio, resposta["relogio"])
     print(f"[{NOME}] RECEBIDO: {resposta}", flush=True)
     return resposta
 
 
 def esperar(segundos):
+    global relogio
     # em vez de so dar sleep, aproveita o intervalo para ler o que chegou nos canais
     fim = time() + segundos
     while time() < fim:
         if sub.poll(100):
             canal, dados = sub.recv_multipart()
             msg = msgpack.unpackb(dados)
+            relogio = max(relogio, msg["relogio"])
             print(
                 f"[{NOME}] CANAL {canal.decode()}: {msg['usuario']} disse \"{msg['mensagem']}\""
                 f" | enviado em {msg['timestamp']} | recebido em {time()} | {msg}",
