@@ -6,6 +6,7 @@ const NOME = process.env.NOME || "servidor";
 const PASTA = "dados";
 const ARQ_LOGINS = PASTA + "/logins.txt";
 const ARQ_CANAIS = PASTA + "/canais.json";
+const ARQ_MENSAGENS = PASTA + "/mensagens.txt";
 
 fs.mkdirSync(PASTA, { recursive: true });
 
@@ -14,6 +15,10 @@ let canais = [];
 if (fs.existsSync(ARQ_CANAIS)) {
   canais = JSON.parse(fs.readFileSync(ARQ_CANAIS));
 }
+
+// socket para publicar nos canais (passa pelo proxy)
+const pub = new zmq.Publisher();
+pub.connect("tcp://proxy:5557");
 
 function agora() {
   return Date.now() / 1000;
@@ -26,6 +31,10 @@ function salvarLogin(usuario, timestamp) {
 
 function salvarCanais() {
   fs.writeFileSync(ARQ_CANAIS, JSON.stringify(canais));
+}
+
+function salvarMensagem(publicacao) {
+  fs.appendFileSync(ARQ_MENSAGENS, JSON.stringify(publicacao) + "\n");
 }
 
 function nomeValido(nome) {
@@ -53,6 +62,31 @@ function criarCanal(msg) {
   return { tipo: "canal", status: "ok" };
 }
 
+async function publicar(msg) {
+  if (!nomeValido(msg.canal)) {
+    return { tipo: "publicar", status: "erro", erro: "nome de canal invalido" };
+  }
+  if (typeof msg.mensagem !== "string" || msg.mensagem == "") {
+    return { tipo: "publicar", status: "erro", erro: "mensagem vazia" };
+  }
+  // nao da pra conferir se o canal existe porque ele pode ter sido
+  // criado em outro servidor (o broker distribui as requisicoes)
+
+  const publicacao = {
+    tipo: "publicacao",
+    canal: msg.canal,
+    usuario: msg.usuario,
+    mensagem: msg.mensagem,
+    servidor: NOME,
+    timestamp: agora(),
+  };
+  // o topico e o nome do canal
+  await pub.send([msg.canal, encode(publicacao)]);
+  console.log(`[${NOME}] PUBLICADO em ${msg.canal}:`, JSON.stringify(publicacao));
+  salvarMensagem(publicacao);
+  return { tipo: "publicar", status: "ok" };
+}
+
 async function main() {
   const socket = new zmq.Reply();
   socket.connect("tcp://broker:5556");
@@ -69,6 +103,8 @@ async function main() {
       resposta = criarCanal(msg);
     } else if (msg.tipo == "listar") {
       resposta = { tipo: "listar", status: "ok", canais: canais };
+    } else if (msg.tipo == "publicar") {
+      resposta = await publicar(msg);
     } else {
       resposta = { tipo: msg.tipo, status: "erro", erro: "tipo de mensagem desconhecido" };
     }

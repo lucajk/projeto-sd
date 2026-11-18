@@ -3,12 +3,22 @@ const { encode, decode } = require("@msgpack/msgpack");
 
 const NOME = process.env.NOME || "bot";
 const NOMES_CANAIS = ["geral", "jogos", "musica", "filmes", "estudos", "futebol", "memes", "series"];
+const FRASES = ["oi pessoal", "alguem ai?", "bom dia", "kkkkk", "concordo", "nao sei", "que legal", "to com sono", "bora", "vou almocar"];
 
 const socket = new zmq.Request();
 socket.connect("tcp://broker:5555");
 
+// socket que recebe as publicacoes dos canais
+const sub = new zmq.Subscriber();
+sub.connect("tcp://proxy:5558");
+const inscritos = [];
+
 function dormir(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function sortear(lista) {
+  return lista[Math.floor(Math.random() * lista.length)];
 }
 
 async function enviar(msg) {
@@ -21,6 +31,19 @@ async function enviar(msg) {
   return resposta;
 }
 
+// fica rodando junto com o resto, mostrando o que chega nos canais
+async function receberPublicacoes() {
+  for await (const [canal, dados] of sub) {
+    const msg = decode(dados);
+    const recebido = Date.now() / 1000;
+    console.log(
+      `[${NOME}] CANAL ${canal.toString()}: ${msg.usuario} disse "${msg.mensagem}"` +
+        ` | enviado em ${msg.timestamp} | recebido em ${recebido} |`,
+      JSON.stringify(msg)
+    );
+  }
+}
+
 async function main() {
   // login: fica tentando ate dar certo
   while (true) {
@@ -29,17 +52,40 @@ async function main() {
     await dormir(1000);
   }
 
-  while (true) {
-    const resposta = await enviar({ tipo: "listar" });
-    const canais = resposta.canais;
+  receberPublicacoes();
 
-    // se o canal sorteado ainda nao existe o bot cria
-    const canal = NOMES_CANAIS[Math.floor(Math.random() * NOMES_CANAIS.length)];
-    if (!canais.includes(canal)) {
-      await enviar({ tipo: "canal", canal: canal });
+  while (true) {
+    let canais = (await enviar({ tipo: "listar" })).canais;
+
+    // menos de 5 canais: cria mais um
+    if (canais.length < 5) {
+      const opcoes = NOMES_CANAIS.filter((c) => !canais.includes(c));
+      await enviar({ tipo: "canal", canal: sortear(opcoes) });
+      canais = (await enviar({ tipo: "listar" })).canais;
     }
 
-    await dormir(3000);
+    // inscrito em menos de 3: se inscreve em mais um
+    if (inscritos.length < 3) {
+      const opcoes = canais.filter((c) => !inscritos.includes(c));
+      if (opcoes.length > 0) {
+        const canal = sortear(opcoes);
+        sub.subscribe(canal);
+        inscritos.push(canal);
+        console.log(`[${NOME}] inscrito no canal ${canal} (inscritos: ${inscritos})`);
+      }
+    }
+
+    if (canais.length == 0) {
+      await dormir(1000);
+      continue;
+    }
+
+    const canal = sortear(canais);
+    for (let i = 0; i < 10; i++) {
+      const texto = sortear(FRASES) + " " + Math.floor(Math.random() * 1000);
+      await enviar({ tipo: "publicar", canal: canal, usuario: NOME, mensagem: texto });
+      await dormir(1000);
+    }
   }
 }
 
