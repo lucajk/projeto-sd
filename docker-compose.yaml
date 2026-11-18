@@ -7,6 +7,13 @@ services:
     volumes:
       - ./python/broker.py:/app/main.py
 
+  proxy:
+    build: ./python
+    image: projeto-sd:python
+    container_name: proxy
+    volumes:
+      - ./python/proxy.py:/app/main.py
+
   servidor_py_1:
     build: ./python
     image: projeto-sd:python
@@ -17,6 +24,7 @@ services:
       - ./dados/servidor_py_1:/app/dados
     depends_on:
       - broker
+      - proxy
 
   servidor_py_2:
     build: ./python
@@ -28,6 +36,7 @@ services:
       - ./dados/servidor_py_2:/app/dados
     depends_on:
       - broker
+      - proxy
 
   servidor_js_1:
     build: ./js
@@ -39,6 +48,7 @@ services:
       - ./dados/servidor_js_1:/app/dados
     depends_on:
       - broker
+      - proxy
 
   servidor_js_2:
     build: ./js
@@ -50,6 +60,7 @@ services:
       - ./dados/servidor_js_2:/app/dados
     depends_on:
       - broker
+      - proxy
 
   bot_py_1:
     build: ./python
