@@ -70,7 +70,7 @@ Funcionamento dos bots (o padrão do enunciado). A cada volta do loop:
 
 O bot em Python não usa thread: no intervalo de 1 segundo entre as mensagens ele fica lendo o socket SUB. O de JavaScript lê as publicações em uma função assíncrona separada.
 
-Um problema que apareceu: o servidor não consegue conferir se o canal da publicação existe, porque o canal pode ter sido criado em outro servidor. Por enquanto o servidor só confere se o nome é válido e se a mensagem não está vazia.
+Um problema que apareceu: no começo o servidor não conseguia conferir se o canal da publicação existia, porque o canal podia ter sido criado em outro servidor. Isso foi resolvido na parte 5 com a réplica dos dados.
 
 ## Parte 3: relógios e heartbeat
 
@@ -114,3 +114,48 @@ Mudança em relação ao Berkeley original: no original o coordenador é quem pe
 Um problema que apareceu nos testes: no começo um servidor conectava no outro pelo nome do container. Quando a gente parava o coordenador para testar a eleição, o nome dele sumia da rede do Docker, e o ZeroMQ ficava uns 5 segundos tentando resolver esse nome. Durante esse tempo o servidor não respondia os outros, então um servidor de rank menor achava que estava sozinho e se declarava coordenador (depois o de rank maior tomava o lugar, mas demorava). Resolvemos fazendo o servidor mandar o seu ip para a referência e conectando sempre pelo ip.
 
 No servidor em Python as requisições dos outros servidores são atendidas em uma thread separada. Sem isso dois servidores podiam ficar travados um esperando a resposta do outro durante a eleição. No JavaScript não precisa porque as funções assíncronas já rodam intercaladas.
+
+## Parte 5: consistência e replicação
+
+O problema: o broker distribui as requisições entre os servidores, então cada servidor ficava só com uma parte dos logins, canais e mensagens. Se um servidor caísse essa parte do histórico sumia, e um cliente que pedisse o histórico recebia só um pedaço.
+
+### Método escolhido
+
+Réplica ativa com atualização por push, com consistência eventual.
+
+Réplica ativa porque o que é enviado para as outras réplicas é a operação de escrita (o login, o canal criado ou a mensagem publicada) no momento em que ela acontece, e cada servidor aplica a operação nos seus próprios arquivos. Push porque quem inicia a propagação é o servidor que recebeu a escrita, sem os outros precisarem pedir.
+
+Consistência eventual porque o servidor responde o cliente sem esperar os outros confirmarem. Por alguns milissegundos os servidores ficam diferentes, mas se pararem de chegar escritas todos terminam com os mesmos dados.
+
+### Como foi implementado
+
+1. O servidor que recebe uma escrita grava no seu disco e publica no tópico `replica` (pelo mesmo proxy do Pub/Sub) uma mensagem com o tipo do dado (`login`, `canal` ou `mensagem`) e o conteúdo.
+2. Todos os servidores ficam inscritos em `replica`. Quem recebe grava o dado, se ainda não tiver.
+3. Cada login e cada mensagem tem um campo `id` (quem criou + timestamp). O servidor guarda os ids que já tem e ignora os repetidos. Para canal o próprio nome serve de id.
+4. Quando um servidor inicia ele manda uma requisição `sincronizar` (na porta 5560) para outro servidor da lista da referência e recebe tudo que aquele servidor tem.
+
+Foi adicionada também a requisição `historico` (`canal`), que devolve o total de mensagens do canal e as 5 últimas. Os bots pedem o histórico antes de cada sequência de 10 mensagens. Como cada servidor grava as mensagens na ordem em que elas chegam, a resposta é ordenada pelo relógio lógico (e pelo timestamp em caso de empate) para todos os servidores responderem na mesma ordem.
+
+Com os canais replicados o servidor voltou a conferir se o canal existe antes de publicar.
+
+### Mudanças no método
+
+O passo 4 não é push, é pull. Tivemos que adicionar porque o Pub/Sub não guarda mensagem: o que é publicado enquanto um servidor está fora do ar nunca chega nele. Então um servidor que cai e volta (ou um servidor novo) ficava com um buraco no histórico. Com o pull na inicialização ele copia o que perdeu e depois segue recebendo pelo push. Como o servidor se inscreve no tópico antes de pedir a cópia, o que chegar repetido é descartado pelo id.
+
+Outro problema que apareceu nos testes: na cópia inicial o servidor gravava os registros um por um, abrindo o arquivo a cada registro. Um servidor que tinha ficado uns 15 minutos fora precisou copiar 4 mil registros e levou mais de um minuto, e nesse tempo ele não respondia a eleição (um servidor de rank menor acabou virando coordenador até ele terminar). Agora a cópia inicial grava tudo de uma vez só.
+
+### Limitações
+
+- Se uma mensagem de réplica se perder com o servidor no ar (por exemplo, o proxy cair), ele só recupera quando reiniciar.
+- Não tem resolução de conflito porque os dados só são adicionados, nunca alterados: duas mensagens diferentes nunca brigam entre si, e se dois servidores criarem o mesmo canal ao mesmo tempo o resultado é o mesmo canal nos dois.
+
+### Como testar
+
+```
+docker compose stop servidor_py_1
+(esperar um pouco)
+docker compose start servidor_py_1
+wc -l dados/*/mensagens.txt
+```
+
+No log do servidor que voltou aparece `dados copiados de ...` com a quantidade de registros que ele tinha perdido, e os arquivos de todos os servidores ficam com a mesma quantidade de linhas (pode ter diferença de uma ou duas enquanto os bots estão mandando).
