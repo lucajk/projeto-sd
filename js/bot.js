@@ -5,13 +5,20 @@ const NOME = process.env.NOME || "bot";
 const NOMES_CANAIS = ["geral", "jogos", "musica", "filmes", "estudos", "futebol", "memes", "series"];
 const FRASES = ["oi pessoal", "alguem ai?", "bom dia", "kkkkk", "concordo", "nao sei", "que legal", "to com sono", "bora", "vou almocar"];
 
-const socket = new zmq.Request();
-socket.connect("tcp://broker:5555");
+function conectar() {
+  const s = new zmq.Request({ receiveTimeout: 5000, linger: 0 });
+  s.connect("tcp://broker:5555");
+  return s;
+}
+
+let socket = conectar();
 
 // socket que recebe as publicacoes dos canais
 const sub = new zmq.Subscriber();
 sub.connect("tcp://proxy:5558");
 const inscritos = [];
+
+let relogio = 0; // relogio logico
 
 function dormir(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -22,11 +29,26 @@ function sortear(lista) {
 }
 
 async function enviar(msg) {
-  msg.timestamp = Date.now() / 1000;
-  console.log(`[${NOME}] ENVIADO: `, JSON.stringify(msg));
-  await socket.send(encode(msg));
-  const [dados] = await socket.receive();
-  const resposta = decode(dados);
+  let resposta;
+  while (true) {
+    relogio += 1;
+    msg.relogio = relogio;
+    msg.timestamp = Date.now() / 1000;
+    console.log(`[${NOME}] ENVIADO: `, JSON.stringify(msg));
+    await socket.send(encode(msg));
+    try {
+      const [dados] = await socket.receive();
+      resposta = decode(dados);
+      break;
+    } catch (erro) {
+      // ninguem respondeu em 5s (o servidor pode ter caido no meio)
+      // o REQ fica travado esperando, entao abre outro e manda de novo
+      console.log(`[${NOME}] sem resposta, tentando de novo`);
+      socket.close();
+      socket = conectar();
+    }
+  }
+  relogio = Math.max(relogio, resposta.relogio);
   console.log(`[${NOME}] RECEBIDO:`, JSON.stringify(resposta));
   return resposta;
 }
@@ -35,6 +57,7 @@ async function enviar(msg) {
 async function receberPublicacoes() {
   for await (const [canal, dados] of sub) {
     const msg = decode(dados);
+    relogio = Math.max(relogio, msg.relogio);
     const recebido = Date.now() / 1000;
     console.log(
       `[${NOME}] CANAL ${canal.toString()}: ${msg.usuario} disse "${msg.mensagem}"` +
