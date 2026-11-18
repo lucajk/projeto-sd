@@ -104,6 +104,8 @@ async function main() {
     }
 
     const canal = sortear(canais);
+    // recupera as mensagens anteriores do canal
+    await enviar({ tipo: "historico", canal: canal });
     for (let i = 0; i < 10; i++) {
       const texto = sortear(FRASES) + " " + Math.floor(Math.random() * 1000);
       await enviar({ tipo: "publicar", canal: canal, usuario: NOME, mensagem: texto });
