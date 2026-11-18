@@ -97,6 +97,8 @@ while True:
         continue
 
     canal = random.choice(canais)
+    # recupera as mensagens anteriores do canal
+    enviar({"tipo": "historico", "canal": canal})
     for i in range(10):
         texto = random.choice(FRASES) + " " + str(random.randint(0, 999))
         enviar({"tipo": "publicar", "canal": canal, "usuario": NOME, "mensagem": texto})

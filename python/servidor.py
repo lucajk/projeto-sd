@@ -27,6 +27,8 @@ pub.connect("tcp://proxy:5557")
 sub = context.socket(zmq.SUB)
 sub.connect("tcp://proxy:5558")
 sub.setsockopt_string(zmq.SUBSCRIBE, "servers")
+# e para receber as replicas dos outros servidores
+sub.setsockopt_string(zmq.SUBSCRIBE, "replica")
 
 # socket para falar com o servico de referencia
 ref = context.socket(zmq.REQ)
@@ -48,11 +50,28 @@ trava = threading.Lock()
 
 os.makedirs(PASTA, exist_ok=True)
 
-# carrega os canais que ja estavam salvos
+# carrega tudo que ja estava salvo em disco
 canais = []
+logins = []
+mensagens = []
+conhecidos = set()  # ids dos logins e mensagens que esse servidor ja tem
+
 if os.path.exists(ARQ_CANAIS):
     with open(ARQ_CANAIS) as f:
         canais = json.load(f)
+if os.path.exists(ARQ_LOGINS):
+    with open(ARQ_LOGINS) as f:
+        for linha in f:
+            logins.append(json.loads(linha))
+if os.path.exists(ARQ_MENSAGENS):
+    with open(ARQ_MENSAGENS) as f:
+        for linha in f:
+            mensagens.append(json.loads(linha))
+for registro in logins + mensagens:
+    conhecidos.add(registro["id"])
+# continua o relogio logico de onde as mensagens salvas pararam
+for m in mensagens:
+    relogio = max(relogio, m["relogio"])
 
 
 def agora():
@@ -73,19 +92,79 @@ def atualizar_relogio(recebido):
         relogio = max(relogio, recebido)
 
 
-def salvar_login(usuario, timestamp):
+# as funcoes guardar_ devolvem False quando o servidor ja tinha o dado
+# (a mesma replica pode chegar mais de uma vez)
+
+def guardar_login(registro):
+    if registro["id"] in conhecidos:
+        return False
+    conhecidos.add(registro["id"])
+    logins.append(registro)
     with open(ARQ_LOGINS, "a") as f:
-        f.write(json.dumps({"usuario": usuario, "timestamp": timestamp}) + "\n")
+        f.write(json.dumps(registro) + "\n")
+    return True
 
 
-def salvar_canais():
+def guardar_canal(canal):
+    if canal in canais:
+        return False
+    canais.append(canal)
     with open(ARQ_CANAIS, "w") as f:
         json.dump(canais, f)
+    return True
 
 
-def salvar_mensagem(publicacao):
+def guardar_mensagem(publicacao):
+    if publicacao["id"] in conhecidos:
+        return False
+    conhecidos.add(publicacao["id"])
+    mensagens.append(publicacao)
     with open(ARQ_MENSAGENS, "a") as f:
         f.write(json.dumps(publicacao) + "\n")
+    return True
+
+
+def guardar_varios(arquivo, lista, registros):
+    # usado na copia inicial dos dados. grava todos os registros novos de uma vez:
+    # gravando um por um (abrindo o arquivo a cada registro) um servidor que tinha
+    # ficado muito tempo fora levava mais de um minuto para voltar
+    novos = []
+    for registro in registros:
+        if registro["id"] not in conhecidos:
+            conhecidos.add(registro["id"])
+            lista.append(registro)
+            novos.append(registro)
+    if len(novos) > 0:
+        with open(arquivo, "a") as f:
+            f.write("".join(json.dumps(r) + "\n" for r in novos))
+    return len(novos)
+
+
+def replicar(dado, conteudo):
+    # manda a escrita para os outros servidores pelo topico replica
+    msg = {
+        "tipo": "replica",
+        "dado": dado,
+        "conteudo": conteudo,
+        "servidor": NOME,
+        "relogio": incrementar_relogio(),
+        "timestamp": agora(),
+    }
+    pub.send_multipart([b"replica", msgpack.packb(msg)])
+    print(f"[{NOME}] PUBLICADO em replica: {msg}", flush=True)
+
+
+def aplicar_replica(msg):
+    if msg["servidor"] == NOME:
+        return  # fui eu que mandei
+    if msg["dado"] == "login":
+        novo = guardar_login(msg["conteudo"])
+    elif msg["dado"] == "canal":
+        novo = guardar_canal(msg["conteudo"])
+    else:
+        novo = guardar_mensagem(msg["conteudo"])
+    if novo:
+        print(f"[{NOME}] replica de {msg['servidor']} gravada ({msg['dado']})", flush=True)
 
 
 def nome_valido(nome):
@@ -123,7 +202,15 @@ def pedir_servidor(destino, endereco, msg):
     try:
         resposta = msgpack.unpackb(s.recv())
         atualizar_relogio(resposta["relogio"])
-        print(f"[{NOME}] RECEBIDO de {destino}: {resposta}", flush=True)
+        if resposta["tipo"] == "sincronizar":
+            # essa resposta tem o historico inteiro, mostra so o tamanho
+            print(
+                f"[{NOME}] RECEBIDO de {destino}: sincronizar com {len(resposta['canais'])} canais,"
+                f" {len(resposta['logins'])} logins e {len(resposta['mensagens'])} mensagens",
+                flush=True,
+            )
+        else:
+            print(f"[{NOME}] RECEBIDO de {destino}: {resposta}", flush=True)
     except zmq.Again:
         resposta = None
         print(f"[{NOME}] {destino} nao respondeu", flush=True)
@@ -133,6 +220,28 @@ def pedir_servidor(destino, endereco, msg):
 
 def heartbeat():
     pedir_referencia({"tipo": "heartbeat", "nome": NOME, "endereco": ENDERECO})
+
+
+def sincronizar_dados():
+    # quando o servidor entra (ou volta depois de cair) ele pede tudo para um
+    # servidor que ja esta rodando, porque o que foi publicado no topico replica
+    # enquanto ele estava fora nao chega mais
+    servidores = pedir_referencia({"tipo": "lista"})["servidores"]
+    for s in servidores:
+        if s["nome"] == NOME:
+            continue
+        resposta = pedir_servidor(s["nome"], s["endereco"], {"tipo": "sincronizar", "nome": NOME})
+        if resposta is None:
+            continue
+        novos = 0
+        for canal in resposta["canais"]:
+            novos += guardar_canal(canal)
+        novos += guardar_varios(ARQ_LOGINS, logins, resposta["logins"])
+        novos += guardar_varios(ARQ_MENSAGENS, mensagens, resposta["mensagens"])
+        for publicacao in resposta["mensagens"]:
+            atualizar_relogio(publicacao["relogio"])
+        print(f"[{NOME}] dados copiados de {s['nome']}: {novos} registros novos", flush=True)
+        break
 
 
 def anunciar_coordenador():
@@ -232,6 +341,14 @@ def atender_servidores():
                 resposta = berkeley(msg)
             else:
                 resposta = {"tipo": "relogio", "status": "erro", "erro": "nao sou o coordenador"}
+        elif msg["tipo"] == "sincronizar":
+            resposta = {
+                "tipo": "sincronizar",
+                "status": "ok",
+                "canais": list(canais),
+                "logins": list(logins),
+                "mensagens": list(mensagens),
+            }
         else:
             resposta = {"tipo": msg["tipo"], "status": "erro", "erro": "tipo de mensagem desconhecido"}
 
@@ -239,14 +356,24 @@ def atender_servidores():
         resposta["relogio"] = incrementar_relogio()
         resposta["timestamp"] = agora()
         rep.send(msgpack.packb(resposta))
-        print(f"[{NOME}] ENVIADO para {msg.get('nome')}:  {resposta}", flush=True)
+        if msg["tipo"] == "sincronizar":
+            print(f"[{NOME}] ENVIADO para {msg.get('nome')}:  todos os dados ({len(mensagens)} mensagens)", flush=True)
+        else:
+            print(f"[{NOME}] ENVIADO para {msg.get('nome')}:  {resposta}", flush=True)
 
 
 def login(msg):
     usuario = msg.get("usuario")
     if not nome_valido(usuario):
         return {"tipo": "login", "status": "erro", "erro": "nome de usuario invalido"}
-    salvar_login(usuario, msg["timestamp"])
+    registro = {
+        "id": f"{usuario}-{msg['timestamp']}",
+        "usuario": usuario,
+        "timestamp": msg["timestamp"],
+        "servidor": NOME,
+    }
+    guardar_login(registro)
+    replicar("login", registro)
     return {"tipo": "login", "status": "ok"}
 
 
@@ -256,8 +383,8 @@ def criar_canal(msg):
         return {"tipo": "canal", "status": "erro", "erro": "nome de canal invalido"}
     if canal in canais:
         return {"tipo": "canal", "status": "erro", "erro": "canal ja existe"}
-    canais.append(canal)
-    salvar_canais()
+    guardar_canal(canal)
+    replicar("canal", canal)
     return {"tipo": "canal", "status": "ok"}
 
 
@@ -272,23 +399,42 @@ def publicar(msg):
         return {"tipo": "publicar", "status": "erro", "erro": "nome de canal invalido"}
     if not isinstance(texto, str) or texto == "":
         return {"tipo": "publicar", "status": "erro", "erro": "mensagem vazia"}
-    # nao da pra conferir se o canal existe porque ele pode ter sido
-    # criado em outro servidor (o broker distribui as requisicoes)
+    # agora que os canais sao replicados da pra conferir se o canal existe
+    if canal not in canais:
+        return {"tipo": "publicar", "status": "erro", "erro": "canal nao existe"}
 
+    hora = agora()
     publicacao = {
+        "id": f"{NOME}-{hora}",
         "tipo": "publicacao",
         "canal": canal,
         "usuario": msg.get("usuario"),
         "mensagem": texto,
         "servidor": NOME,
-        "timestamp": agora(),
+        "timestamp": hora,
         "relogio": incrementar_relogio(),
     }
     # o topico e o nome do canal
     pub.send_multipart([canal.encode(), msgpack.packb(publicacao)])
     print(f"[{NOME}] PUBLICADO em {canal}: {publicacao}", flush=True)
-    salvar_mensagem(publicacao)
+    guardar_mensagem(publicacao)
+    replicar("mensagem", publicacao)
     return {"tipo": "publicar", "status": "ok"}
+
+
+def historico(msg):
+    canal = msg.get("canal")
+    do_canal = [m for m in mensagens if m["canal"] == canal]
+    # cada servidor grava em uma ordem diferente (depende de quando a replica chega),
+    # entao ordena pelo relogio logico para todos responderem igual
+    do_canal.sort(key=lambda m: (m["relogio"], m["timestamp"]))
+    return {
+        "tipo": "historico",
+        "status": "ok",
+        "canal": canal,
+        "total": len(do_canal),
+        "mensagens": do_canal[-5:],  # so as 5 ultimas para nao encher a tela
+    }
 
 
 def atender_cliente():
@@ -306,6 +452,8 @@ def atender_cliente():
         resposta = listar_canais(msg)
     elif tipo == "publicar":
         resposta = publicar(msg)
+    elif tipo == "historico":
+        resposta = historico(msg)
     else:
         resposta = {"tipo": tipo, "status": "erro", "erro": "tipo de mensagem desconhecido"}
 
@@ -327,7 +475,9 @@ def atender_cliente():
 threading.Thread(target=atender_servidores, daemon=True).start()
 
 rank = pedir_referencia({"tipo": "rank", "nome": NOME, "endereco": ENDERECO})["rank"]
-print(f"[{NOME}] iniciado com rank {rank}, {len(canais)} canais carregados", flush=True)
+print(f"[{NOME}] iniciado com rank {rank}, {len(canais)} canais e {len(mensagens)} mensagens carregados", flush=True)
+
+sincronizar_dados()
 
 # espera os sockets do pub/sub conectarem, senao o primeiro aviso de coordenador se perde
 sleep(2)
@@ -343,14 +493,17 @@ while True:
         topico, dados = sub.recv_multipart()
         msg = msgpack.unpackb(dados)
         atualizar_relogio(msg["relogio"])
-        print(f"[{NOME}] RECEBIDO do topico servers: {msg}", flush=True)
-        coordenador = msg["coordenador"]
-        endereco_coordenador = msg["endereco"]
-        rank_coordenador = msg["rank"]
-        print(f"[{NOME}] coordenador agora e {coordenador}", flush=True)
-        if rank_coordenador < rank:
-            # meu rank e maior que o do coordenador, entao eu que deveria ser
-            precisa_eleicao = True
+        print(f"[{NOME}] RECEBIDO do topico {topico.decode()}: {msg}", flush=True)
+        if topico == b"replica":
+            aplicar_replica(msg)
+        else:
+            coordenador = msg["coordenador"]
+            endereco_coordenador = msg["endereco"]
+            rank_coordenador = msg["rank"]
+            print(f"[{NOME}] coordenador agora e {coordenador}", flush=True)
+            if rank_coordenador < rank:
+                # meu rank e maior que o do coordenador, entao eu que deveria ser
+                precisa_eleicao = True
 
     if socket in eventos:
         atender_cliente()
