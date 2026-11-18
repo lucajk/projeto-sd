@@ -12,7 +12,7 @@ Integrantes:
 docker compose up
 ```
 
-Sobem o broker, o proxy, 4 servidores (2 em Python e 2 em JavaScript) e 4 bots (2 de cada linguagem). Os dados de cada servidor ficam na pasta `dados/<nome do servidor>` (criada na primeira execução). Para começar do zero é só apagar a pasta `dados`.
+Sobem o broker, o proxy, a referência, 4 servidores (2 em Python e 2 em JavaScript) e 4 bots (2 de cada linguagem). Os dados de cada servidor ficam na pasta `dados/<nome do servidor>` (criada na primeira execução). Para começar do zero é só apagar a pasta `dados`.
 
 ## Escolhas
 
@@ -20,7 +20,7 @@ Sobem o broker, o proxy, 4 servidores (2 em Python e 2 em JavaScript) e 4 bots (
 
 Python e JavaScript (Node.js). Como somos uma dupla, cada linguagem tem o seu cliente (bot) e o seu servidor, e todos conversam entre si: um bot em Python pode ser atendido por um servidor em JavaScript e o contrário também.
 
-O broker e o proxy foram feitos em Python, a partir dos exemplos das aulas (broker: ROUTER na porta 5555 para os clientes e DEALER na 5556 para os servidores).
+O broker, o proxy e o serviço de referência foram feitos em Python, os dois primeiros a partir dos exemplos das aulas (broker: ROUTER na porta 5555 para os clientes e DEALER na 5556 para os servidores).
 
 ### Serialização
 
@@ -71,3 +71,23 @@ Funcionamento dos bots (o padrão do enunciado). A cada volta do loop:
 O bot em Python não usa thread: no intervalo de 1 segundo entre as mensagens ele fica lendo o socket SUB. O de JavaScript lê as publicações em uma função assíncrona separada.
 
 Um problema que apareceu: o servidor não consegue conferir se o canal da publicação existe, porque o canal pode ter sido criado em outro servidor. Por enquanto o servidor só confere se o nome é válido e se a mensagem não está vazia.
+
+## Parte 3: relógios e heartbeat
+
+Relógio lógico: todos os processos (bots, servidores e referência) têm um contador. Ele é incrementado antes de cada envio e vai no campo `relogio` de toda mensagem. Quando chega uma mensagem, o processo fica com o maior valor entre o seu contador e o que recebeu.
+
+Foi adicionado o container `referencia` (porta 5559, REQ/REP), que só conversa com os servidores:
+
+| tipo | o servidor manda | a referência responde |
+|---|---|---|
+| `rank` | `nome` e `endereco` (ip do container) | `rank` |
+| `lista` | nada | `servidores` (nome, rank e endereço de cada um) |
+| `heartbeat` | `nome` e `endereco` | `status` e `hora` |
+
+O rank é a ordem de chegada (o primeiro servidor que pede fica com 1, o segundo com 2...). Se o mesmo nome pedir de novo recebe o mesmo rank.
+
+A cada 10 mensagens de clientes o servidor manda um heartbeat. A referência guarda a hora do último heartbeat de cada servidor, e quem fica mais de 30 segundos sem mandar sai da lista. Se ele voltar a mandar heartbeat entra de novo com o mesmo rank.
+
+Relógio físico: a resposta do heartbeat traz a hora da referência, e o servidor guarda a diferença para o seu próprio relógio na variável `ajuste`. Todos os timestamps do servidor são a hora do container mais esse ajuste.
+
+Os bots também ganharam um tempo limite de 5 segundos na requisição. Se o servidor que ia responder cair no meio, o socket REQ fica travado esperando para sempre, então o bot fecha o socket, abre outro e manda de novo.
