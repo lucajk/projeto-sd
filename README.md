@@ -82,12 +82,35 @@ Foi adicionado o container `referencia` (porta 5559, REQ/REP), que só conversa 
 |---|---|---|
 | `rank` | `nome` e `endereco` (ip do container) | `rank` |
 | `lista` | nada | `servidores` (nome, rank e endereço de cada um) |
-| `heartbeat` | `nome` e `endereco` | `status` e `hora` |
+| `heartbeat` | `nome` e `endereco` | `status` |
 
 O rank é a ordem de chegada (o primeiro servidor que pede fica com 1, o segundo com 2...). Se o mesmo nome pedir de novo recebe o mesmo rank.
 
 A cada 10 mensagens de clientes o servidor manda um heartbeat. A referência guarda a hora do último heartbeat de cada servidor, e quem fica mais de 30 segundos sem mandar sai da lista. Se ele voltar a mandar heartbeat entra de novo com o mesmo rank.
 
-Relógio físico: a resposta do heartbeat traz a hora da referência, e o servidor guarda a diferença para o seu próprio relógio na variável `ajuste`. Todos os timestamps do servidor são a hora do container mais esse ajuste.
+Relógio físico: na parte 3 a resposta do heartbeat trazia a hora da referência. Na parte 4 isso foi trocado pela sincronização com o coordenador (a referência não devolve mais a hora). O servidor guarda a correção na variável `ajuste`, e todos os timestamps dele são a hora do container mais esse ajuste.
 
 Os bots também ganharam um tempo limite de 5 segundos na requisição. Se o servidor que ia responder cair no meio, o socket REQ fica travado esperando para sempre, então o bot fecha o socket, abre outro e manda de novo.
+
+## Parte 4: eleição e sincronização com o coordenador
+
+Agora os servidores conversam entre si. Cada servidor abre um socket REP na porta 5560 e os outros conectam usando o endereço (ip) que está na lista da referência.
+
+| tipo | quem manda | resposta |
+|---|---|---|
+| `eleicao` | servidor que percebeu que não tem coordenador | `status` ok |
+| `relogio` | servidor, com a sua `hora` | `hora` correta (só o coordenador responde) |
+
+Eleição (algoritmo do valentão): o servidor pede a lista para a referência e manda `eleicao` para todos que têm rank maior que o dele. Se alguém responder, ele espera o aviso de quem ganhou. Se ninguém responder em 1,5 segundo, ele vira o coordenador e publica o seu nome no tópico `servers`. Quem recebe uma mensagem de `eleicao` responde OK e faz a própria eleição. No fim ganha o servidor vivo com o maior rank.
+
+Todos os servidores ficam inscritos no tópico `servers` e guardam o nome na variável `coordenador`. Se um servidor recebe o aviso de um coordenador com rank menor que o dele, ele faz uma eleição (isso acontece quando um servidor de rank maior volta).
+
+A eleição acontece quando o servidor inicia (ainda não tem coordenador) e quando o coordenador não responde o pedido de relógio.
+
+Sincronização (Berkeley): a cada 15 mensagens de clientes o servidor manda a sua hora para o coordenador. O coordenador guarda a diferença entre a hora de cada servidor e a dele, calcula a média dessas diferenças (contando ele mesmo com diferença zero), corrige o próprio relógio por essa média e devolve a hora já corrigida. O servidor soma metade do tempo de ida e volta da requisição para compensar a latência.
+
+Mudança em relação ao Berkeley original: no original o coordenador é quem pergunta a hora para todos e depois manda o ajuste para cada um. Aqui quem inicia é o servidor (seguindo o diagrama do enunciado), então o coordenador calcula a média com a última hora que cada servidor informou. Também ignoramos médias menores que 10 ms, porque como os containers rodam na mesma máquina essa diferença é só o atraso da rede e o relógio ficava andando para trás um pouquinho a cada sincronização.
+
+Um problema que apareceu nos testes: no começo um servidor conectava no outro pelo nome do container. Quando a gente parava o coordenador para testar a eleição, o nome dele sumia da rede do Docker, e o ZeroMQ ficava uns 5 segundos tentando resolver esse nome. Durante esse tempo o servidor não respondia os outros, então um servidor de rank menor achava que estava sozinho e se declarava coordenador (depois o de rank maior tomava o lugar, mas demorava). Resolvemos fazendo o servidor mandar o seu ip para a referência e conectando sempre pelo ip.
+
+No servidor em Python as requisições dos outros servidores são atendidas em uma thread separada. Sem isso dois servidores podiam ficar travados um esperando a resposta do outro durante a eleição. No JavaScript não precisa porque as funções assíncronas já rodam intercaladas.
