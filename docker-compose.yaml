@@ -1,0 +1,104 @@
+services:
+
+  broker:
+    build: ./python
+    image: projeto-sd:python
+    container_name: broker
+    volumes:
+      - ./python/broker.py:/app/main.py
+
+  servidor_py_1:
+    build: ./python
+    image: projeto-sd:python
+    environment:
+      - NOME=servidor_py_1
+    volumes:
+      - ./python/servidor.py:/app/main.py
+      - ./dados/servidor_py_1:/app/dados
+    depends_on:
+      - broker
+
+  servidor_py_2:
+    build: ./python
+    image: projeto-sd:python
+    environment:
+      - NOME=servidor_py_2
+    volumes:
+      - ./python/servidor.py:/app/main.py
+      - ./dados/servidor_py_2:/app/dados
+    depends_on:
+      - broker
+
+  servidor_js_1:
+    build: ./js
+    image: projeto-sd:js
+    environment:
+      - NOME=servidor_js_1
+    volumes:
+      - ./js/servidor.js:/app/main.js
+      - ./dados/servidor_js_1:/app/dados
+    depends_on:
+      - broker
+
+  servidor_js_2:
+    build: ./js
+    image: projeto-sd:js
+    environment:
+      - NOME=servidor_js_2
+    volumes:
+      - ./js/servidor.js:/app/main.js
+      - ./dados/servidor_js_2:/app/dados
+    depends_on:
+      - broker
+
+  bot_py_1:
+    build: ./python
+    image: projeto-sd:python
+    environment:
+      - NOME=bot_py_1
+    volumes:
+      - ./python/bot.py:/app/main.py
+    depends_on:
+      - servidor_py_1
+      - servidor_py_2
+      - servidor_js_1
+      - servidor_js_2
+
+  bot_py_2:
+    build: ./python
+    image: projeto-sd:python
+    environment:
+      - NOME=bot_py_2
+    volumes:
+      - ./python/bot.py:/app/main.py
+    depends_on:
+      - servidor_py_1
+      - servidor_py_2
+      - servidor_js_1
+      - servidor_js_2
+
+  bot_js_1:
+    build: ./js
+    image: projeto-sd:js
+    environment:
+      - NOME=bot_js_1
+    volumes:
+      - ./js/bot.js:/app/main.js
+    depends_on:
+      - servidor_py_1
+      - servidor_py_2
+      - servidor_js_1
+      - servidor_js_2
+
+  bot_js_2:
+    build: ./js
+    image: projeto-sd:js
+    environment:
+      - NOME=bot_js_2
+    volumes:
+      - ./js/bot.js:/app/main.js
+    depends_on:
+      - servidor_py_1
+      - servidor_py_2
+      - servidor_js_1
+      - servidor_js_2
