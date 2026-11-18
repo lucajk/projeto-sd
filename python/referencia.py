@@ -41,7 +41,7 @@ while True:
                 ranks[nome] = len(ranks) + 1
             ultimo[nome] = time()
             enderecos[nome] = msg.get("endereco")
-            resposta = {"tipo": "heartbeat", "status": "ok", "hora": time()}
+            resposta = {"tipo": "heartbeat", "status": "ok"}
         else:
             resposta = {"tipo": tipo, "status": "erro", "erro": "tipo de mensagem desconhecido"}
 
